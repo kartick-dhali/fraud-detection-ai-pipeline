@@ -17,7 +17,7 @@ def detect_anomalies(df: pd.DataFrame) -> pd.DataFrame:
     """Flag values above mean + 2*std because it is easy for operators to explain."""
 
     mean_amount = df["fraud_amount"].mean()
-    std_amount = df["fraud_amount"].std(ddof=0)
+    std_amount = df["fraud_amount"].std()
     threshold = mean_amount + (2 * std_amount)
     return df.assign(alert=df["fraud_amount"] > threshold, threshold=threshold)
 
