@@ -1,0 +1,26 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowDatabricksAssumeRoleWithExternalId",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::414351767826:root"
+      },
+      "Action": "sts:AssumeRole",
+      "Condition": {
+        "StringEquals": {
+          "sts:ExternalId": "REPLACE_WITH_DATABRICKS_EXTERNAL_ID"
+        }
+      }
+    },
+    {
+      "Sid": "AllowSelfAssumeForValidation",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::077740385275:root"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
