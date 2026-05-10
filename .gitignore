@@ -1,0 +1,8 @@
+__pycache__/
+.pytest_cache/
+.venv/
+data/raw_csv/
+config/llm_pipeline_config.json
+artifacts/
+models/
+chroma/
