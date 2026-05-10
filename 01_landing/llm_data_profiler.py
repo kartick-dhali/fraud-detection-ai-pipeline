@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+from urllib import request
 from pathlib import Path
 from typing import Any
 
@@ -43,31 +44,34 @@ def call_openai_or_fallback(prompt: str) -> str:
     if api_key:
         try:
             client = OpenAI(api_key=api_key)
-            response = client.responses.create(
+            response = client.chat.completions.create(
                 model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-                input=prompt,
                 temperature=0,
+                messages=[{"role": "user", "content": prompt}],
             )
-            return response.output_text
+            return response.choices[0].message.content or ""
         except Exception as exc:
             print(f"OpenAI fallback triggered: {exc}")
 
     ollama_base = os.getenv("OLLAMA_BASE_URL")
     if ollama_base:
         try:
-            import requests
-
-            response = requests.post(
-                f"{ollama_base.rstrip('/')}/api/generate",
-                json={
+            payload = json.dumps(
+                {
                     "model": os.getenv("OLLAMA_MODEL", "llama3.1"),
                     "prompt": prompt,
                     "stream": False,
-                },
-                timeout=30,
+                }
+            ).encode("utf-8")
+            http_request = request.Request(
+                f"{ollama_base.rstrip('/')}/api/generate",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
             )
-            response.raise_for_status()
-            return response.json().get("response", "")
+            with request.urlopen(http_request, timeout=30) as response:
+                body = json.loads(response.read().decode("utf-8"))
+            return body.get("response", "")
         except Exception as exc:
             print(f"Ollama fallback triggered: {exc}")
 

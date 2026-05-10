@@ -31,12 +31,12 @@ def summarize_with_llm(records: list[dict]) -> str:
     if api_key:
         try:
             client = OpenAI(api_key=api_key)
-            response = client.responses.create(
+            response = client.chat.completions.create(
                 model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-                input=prompt,
                 temperature=0,
+                messages=[{"role": "user", "content": prompt}],
             )
-            return response.output_text
+            return response.choices[0].message.content or ""
         except Exception as exc:
             print(f"OpenAI alert failed, using fallback: {exc}")
     return "Fallback executive alert: fraud volume has breached the statistical control band and requires analyst review."
