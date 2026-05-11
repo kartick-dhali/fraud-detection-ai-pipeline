@@ -8,7 +8,7 @@
         "s3:ListBucket",
         "s3:GetBucketLocation"
       ],
-      "Resource": "arn:aws:s3:::fraud-transection-detection"
+      "Resource": "arn:aws:s3:::fraud-transection-detection-nabo"
     },
     {
       "Sid": "ReadWriteFraudObjects",
@@ -20,7 +20,7 @@
         "s3:AbortMultipartUpload",
         "s3:ListBucketMultipartUploads"
       ],
-      "Resource": "arn:aws:s3:::fraud-transection-detection/*"
+      "Resource": "arn:aws:s3:::fraud-transection-detection-nabo/*"
     }
   ]
 }

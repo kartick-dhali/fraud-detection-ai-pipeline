@@ -10,7 +10,7 @@
       "Action": "sts:AssumeRole",
       "Condition": {
         "StringEquals": {
-          "sts:ExternalId": "REPLACE_WITH_DATABRICKS_EXTERNAL_ID"
+          "sts:ExternalId": "2ced7911-e55a-4495-9893-37c4eda9f023"
         }
       }
     },
@@ -18,7 +18,7 @@
       "Sid": "AllowSelfAssumeForValidation",
       "Effect": "Allow",
       "Principal": {
-        "AWS": "arn:aws:iam::077740385275:root"
+        "AWS": "arn:aws:iam::346720668814:root"
       },
       "Action": "sts:AssumeRole"
     }
