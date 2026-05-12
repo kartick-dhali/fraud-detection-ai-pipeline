@@ -1,8 +1,6 @@
-"""
-Databricks bootstrap notebook for storage credential and external location setup.
+"""Databricks bootstrap notebook for storage credential and external location setup.
 
 Run this ONCE per environment (dev/test/prod) before running any pipeline notebook.
-This file is intentionally verbose - setup code is where operators need most context.
 
 Your real values:
   - AWS Account ID  : 346720668814
@@ -30,7 +28,7 @@ class SetupConfig:
     """Container for the values that operators need to update once per environment."""
 
     catalog: str = "fraud"
-    schema: str = ENVIRONMENT                         # fraud.test / fraud.prod
+    schema: str = ENVIRONMENT
     role_arn: str = "arn:aws:iam::346720668814:role/Databricks_S3_Access_Role"
     external_id: str = "2ced7911-e55a-4495-9893-37c4eda9f023"
     storage_credential_name: str = "databricks_s3_access"   # already exists!
@@ -39,29 +37,30 @@ class SetupConfig:
 
 
 def build_sql(config: SetupConfig) -> list[str]:
-    """Return SQL statements in execution order.
+    """Return SQL statements in execution order. Safe to re-run (IF NOT EXISTS)."""
 
-    Safe to re-run - all statements use IF NOT EXISTS.
-    """
     return [
-        # Step 1: Create Unity Catalog (top-level namespace)
+        # Step 1: Create Unity Catalog
         f"CREATE CATALOG IF NOT EXISTS {config.catalog}",
 
         # Step 2: Create schema inside catalog (fraud.test)
         f"CREATE SCHEMA IF NOT EXISTS {config.catalog}.{config.schema}",
 
-        # Step 3: Create External Location using EXISTING storage credential
-        # Storage credential 'databricks_s3_access' already created in Databricks UI
+        # Step 3: Create External Location using existing storage credential
         (
             "CREATE EXTERNAL LOCATION IF NOT EXISTS "
             f"{config.external_location_name} URL '{config.bucket_url}' "
             f"WITH (STORAGE CREDENTIAL {config.storage_credential_name})"
         ),
 
-        # Step 4: Grant access to all account users
-        f"GRANT USAGE ON EXTERNAL LOCATION {config.external_location_name} TO `account users`",
+        # Step 4: Grant access — READ FILES + WRITE FILES works with Unity Catalog v1.0
+        # NOTE: GRANT USAGE does NOT work with metastore v1.0 → use READ/WRITE FILES
+        (
+            f"GRANT READ FILES, WRITE FILES ON EXTERNAL LOCATION "
+            f"{config.external_location_name} TO `account users`"
+        ),
 
-        # Step 5: Validate everything is correct
+        # Step 5: Validate
         f"DESCRIBE STORAGE CREDENTIAL {config.storage_credential_name}",
         f"DESCRIBE EXTERNAL LOCATION {config.external_location_name}",
     ]
@@ -69,6 +68,7 @@ def build_sql(config: SetupConfig) -> list[str]:
 
 def validate_paths(config: SetupConfig) -> dict[str, str]:
     """Produce the canonical S3 paths used throughout the pipeline."""
+
     return {
         "landing":    f"{config.bucket_url}/raw-landing/",
         "bronze":     f"{config.bucket_url}/bronze/",
@@ -80,22 +80,29 @@ def validate_paths(config: SetupConfig) -> dict[str, str]:
 
 
 def run_setup(spark_session, config: SetupConfig) -> None:
-    """Execute the SQL sequence in Databricks. Run cell by cell in a notebook."""
+    """Execute the SQL sequence in Databricks. Run in a notebook cell by cell."""
+
     for statement in build_sql(config):
-        print(f"\n▶ Executing:\n  {statement}")
-        spark_session.sql(statement).show(truncate=False)
+        print(f"\n▶ Executing:\n  {statement[:120]}")
+        try:
+            spark_session.sql(statement).show(truncate=False)
+            print("  ✅ Done!")
+        except Exception as e:
+            err = str(e)
+            # Skip "already exists" errors — safe to ignore on re-runs
+            if "already exists" in err.lower():
+                print(f"  ⚠️  Already exists — skipping (safe)")
+            else:
+                print(f"  ❌ Error: {err[:200]}")
+                raise
 
     print("\n✅ All setup complete! Validated S3 paths:")
     for name, value in validate_paths(config).items():
         print(f"  {name:12} → {value}")
 
 
-# ── VALIDATE S3 ACCESS ──
-def test_s3_access():
-    """
-    Run this in a Databricks notebook cell to confirm S3 access works.
-    If it lists folders → setup is complete!
-    """
+def test_s3_access() -> None:
+    """Run in a Databricks notebook cell to confirm S3 access works."""
     try:
         files = dbutils.fs.ls(f"s3://{BUCKET_NAME}/")
         print(f"✅ S3 access confirmed! Folders found:")
@@ -103,7 +110,7 @@ def test_s3_access():
             print(f"  {f.path}")
     except Exception as e:
         print(f"❌ S3 access failed: {e}")
-        print("Check: IAM trust policy has correct External ID and your S3 policy is attached")
+        print("Check: IAM trust policy has self-assume + correct External ID")
 
 
 if __name__ == "__main__":
