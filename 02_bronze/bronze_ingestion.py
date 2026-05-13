@@ -1,10 +1,14 @@
 """Bronze Ingestion — Auto Loader pattern (study notes style).
 
+Unity Catalog structure:
+  CATALOG  →  SCHEMA  →  TABLE
+  fraud    →  test    →  bronze
+
 Pattern:
   S3 CSV
   → Auto Loader (cloudFiles) readStream
   → schemaHints + rescuedDataColumn + schemaLocation
-  → writeStream → Delta table (fraud_{env}.bronze)
+  → writeStream → Delta table (fraud.test.bronze)
 
 Usage in Databricks notebook:
     %run ./02_bronze/bronze_ingestion
@@ -23,21 +27,27 @@ base_path       = f"s3://fraud-transection-detection-nabo/{env}"
 landing_path    = f"{base_path}/raw-landing/banking_transaction/"
 schema_path     = f"{base_path}/_schemas/bronze_autoloader/"
 checkpoint_path = f"{base_path}/_checkpoints/bronze_autoloader/"
-bronze_db       = f"fraud_{env}"
+
+# ── Unity Catalog: fraud (catalog) → test (schema) → bronze (table) ──────────
+catalog   = "fraud"
+schema    = env               # "test" or "prod"
+table     = "bronze"
+full_table = f"{catalog}.{schema}.{table}"   # → fraud.test.bronze
 
 print(f"📂 Landing path  : {landing_path}")
 print(f"📂 Schema path   : {schema_path}")
 print(f"📂 Checkpoint    : {checkpoint_path}")
-print(f"📂 Bronze DB     : {bronze_db}")
+print(f"📚 Table         : {full_table}")
 
-# ── STEP 3: Create Schema (Database) in Unity Catalog ─────────────────────────
+# ── STEP 3: Create Schema in fraud catalog ────────────────────────────────────
 # CREATE SCHEMA = just a folder in the 'brain' (Unity Catalog)
 # No data moves until writeStream!
+spark.sql(f"USE CATALOG {catalog}")                                # noqa: F821
 spark.sql(f"""
-    CREATE SCHEMA IF NOT EXISTS {bronze_db}
+    CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}
     MANAGED LOCATION '{base_path}/bronze/'
 """)                                                               # noqa: F821
-print(f"\n✅ Schema ready : {bronze_db}")
+print(f"\n✅ Schema ready : {catalog}.{schema}")
 
 # ── STEP 4: Auto Loader readStream ────────────────────────────────────────────
 # cloudFiles = Auto Loader (Databricks feature)
@@ -81,12 +91,11 @@ print("✅ Auto Loader stream configured!")
 
 # ── STEP 5: writeStream → Bronze Delta Table ──────────────────────────────────
 # trigger(availableNow=True) = process all available files then stop
-#   (like a batch run but using streaming engine)
 # checkpointLocation = bookmark — remembers which files already processed
 #   Rule: every stream MUST have its own unique checkpoint folder!
 # mergeSchema = True → if new columns appear, add them automatically
 # toTable → registers in Unity Catalog automatically!
-print("\n💾 Starting writeStream → Bronze Delta table...")
+print(f"\n💾 Starting writeStream → {full_table}...")
 
 query = (
     df_stream.writeStream
@@ -95,7 +104,7 @@ query = (
     .option("mergeSchema",        "true")
     .outputMode("append")
     .trigger(availableNow=True)
-    .toTable(f"{bronze_db}.bronze")
+    .toTable(full_table)             # → fraud.test.bronze
 )
 
 # Wait for stream to finish
@@ -106,11 +115,11 @@ print("🎉 BRONZE INGESTION COMPLETE!")
 print("=" * 60)
 
 # ── STEP 6: Validate ──────────────────────────────────────────────────────────
-count = spark.sql(f"SELECT COUNT(*) as total FROM {bronze_db}.bronze").collect()[0][0]  # noqa: F821
+count = spark.sql(f"SELECT COUNT(*) as total FROM {full_table}").collect()[0][0]  # noqa: F821
 print(f"\n✅ Total rows in Bronze : {count:,}")
 
 print("\n📋 Sample rows (5):")
-spark.sql(f"""                                                     # noqa: F821
+spark.sql(f"""
     SELECT
         TransactionID,
         AccountID,
@@ -120,13 +129,13 @@ spark.sql(f"""                                                     # noqa: F821
         _rescued_data,
         _ingestion_timestamp,
         _source_file
-    FROM {bronze_db}.bronze
+    FROM {full_table}
     LIMIT 5
-""").show(truncate=False)
+""").show(truncate=False)           # noqa: F821
 
 print(f"""
 📍 Bronze Delta location : {base_path}/bronze/
-📚 Unity Catalog table   : {bronze_db}.bronze
+📚 Unity Catalog table   : {full_table}
 📊 Total rows            : {count:,}
 🛟 Rescued data column   : _rescued_data (bad rows flagged, not lost!)
 

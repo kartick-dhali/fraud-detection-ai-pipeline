@@ -1,7 +1,12 @@
 """Silver Cleaning — foreachBatch pattern (study notes style).
 
+Unity Catalog structure:
+  CATALOG  →  SCHEMA  →  TABLE
+  fraud    →  test    →  silver_transactions
+  fraud    →  test    →  silver_quarantine
+
 Pattern:
-  readStream.table(bronze)
+  readStream.table(fraud.test.bronze)
   → foreachBatch → micro_processing()
       → try_cast  (defensive casting)
       → filter    (good rows only)
@@ -14,7 +19,6 @@ Usage in Databricks notebook:
     %run ./03_silver/silver_cleaning
 """
 
-from pyspark.sql import functions as F
 from pyspark.sql.functions import col, expr, current_date
 
 # ── STEP 1: Environment Widget ────────────────────────────────────────────────
@@ -23,22 +27,29 @@ env = dbutils.widgets.get("environment")                           # noqa: F821
 
 print(f"🌍 Environment : {env}")
 
-# ── STEP 2: All Paths ────────────────────────────────────────────────────────
+# ── STEP 2: All Paths + Table Names ───────────────────────────────────────────
 base_path    = f"s3://fraud-transection-detection-nabo/{env}"
 silver_path  = f"{base_path}/silver"
-bronze_db    = f"fraud_{env}"
-silver_db    = f"fraud_{env}"
 
-print(f"📂 Silver path       : {silver_path}")
-print(f"📂 Silver data       : {silver_path}/silver_data")
-print(f"📂 Silver quarantine : {silver_path}/silver_quarantine")
+# Unity Catalog: fraud.test.bronze / fraud.test.silver_transactions
+catalog      = "fraud"
+schema       = env
+bronze_table          = f"{catalog}.{schema}.bronze"
+silver_table          = f"{catalog}.{schema}.silver_transactions"
+quarantine_table      = f"{catalog}.{schema}.silver_quarantine"
+
+print(f"📖 Reading from  : {bronze_table}")
+print(f"💾 Writing to    : {silver_table}")
+print(f"🚫 Quarantine    : {quarantine_table}")
+print(f"📂 Silver path   : {silver_path}")
 
 # ── STEP 3: Read from Bronze using readStream ─────────────────────────────────
 # IMPORTANT: readStream.table() already has schema → cannot redefine using .schema()
 # We read directly from the registered Bronze Delta table!
-print(f"\n📖 Reading from Bronze table: {bronze_db}.bronze")
+spark.sql(f"USE CATALOG {catalog}")                                # noqa: F821
+print(f"\n📖 Reading from Bronze table: {bronze_table}")
 
-bronze_df = spark.readStream.table(f"{bronze_db}.bronze")          # noqa: F821
+bronze_df = spark.readStream.table(bronze_table)                   # noqa: F821
 
 
 # ── STEP 4: foreachBatch micro_processing() ───────────────────────────────────
@@ -58,11 +69,11 @@ def micro_processing(batch_df, batch_id):
     # try_cast = safe conversion → returns NULL instead of crashing!
     # alias() required after try_cast
     cleaned_df = batch_df.select(
-        expr("try_cast(TransactionAmount  as double)" ).alias("TransactionAmount"),
-        expr("try_cast(TransactionDate    as date)"   ).alias("TransactionDate"),
-        expr("try_cast(CustomerAge        as int)"    ).alias("CustomerAge"),
-        expr("try_cast(LoginAttempts      as int)"    ).alias("LoginAttempts"),
-        expr("try_cast(AccountBalance     as double)" ).alias("AccountBalance"),
+        expr("try_cast(TransactionAmount   as double)").alias("TransactionAmount"),
+        expr("try_cast(TransactionDate     as date)"  ).alias("TransactionDate"),
+        expr("try_cast(CustomerAge         as int)"   ).alias("CustomerAge"),
+        expr("try_cast(LoginAttempts       as int)"   ).alias("LoginAttempts"),
+        expr("try_cast(AccountBalance      as double)").alias("AccountBalance"),
         expr("try_cast(TransactionDuration as int)"   ).alias("TransactionDuration"),
         expr("try_cast(PreviousTransactionDate as date)").alias("PreviousTransactionDate"),
         col("TransactionID"),
@@ -134,7 +145,7 @@ def micro_processing(batch_df, batch_id):
     print(f"   ✅ Batch {batch_id} done!")
 
 
-# ── STEP 5: writeStream with foreachBatch ────────────────────────────────────
+# ── STEP 5: writeStream with foreachBatch ─────────────────────────────────────
 # trigger(availableNow=True) = process all available data then stop
 # checkpointLocation = bookmark — never reprocess same rows!
 # foreachBatch = call micro_processing() for each micro-batch
@@ -157,27 +168,27 @@ print("\n" + "=" * 60)
 print("🎉 SILVER CLEANING COMPLETE!")
 print("=" * 60)
 
-# ── STEP 6: Register Silver tables in Unity Catalog ──────────────────────────
+# ── STEP 6: Register Silver tables in Unity Catalog ───────────────────────────
 spark.sql(f"""                                                     # noqa: F821
-    CREATE TABLE IF NOT EXISTS {silver_db}.silver_transactions
+    CREATE TABLE IF NOT EXISTS {silver_table}
     USING DELTA
     LOCATION '{silver_path}/silver_data'
 """)
 
 spark.sql(f"""                                                     # noqa: F821
-    CREATE TABLE IF NOT EXISTS {silver_db}.silver_quarantine
+    CREATE TABLE IF NOT EXISTS {quarantine_table}
     USING DELTA
     LOCATION '{silver_path}/silver_quarantine'
 """)
 
-# ── STEP 7: Validate ─────────────────────────────────────────────────────────
-good_total = spark.sql(f"SELECT COUNT(*) FROM {silver_db}.silver_transactions").collect()[0][0]  # noqa: F821
-bad_total  = spark.sql(f"SELECT COUNT(*) FROM {silver_db}.silver_quarantine").collect()[0][0]   # noqa: F821
+# ── STEP 7: Validate ──────────────────────────────────────────────────────────
+good_total = spark.sql(f"SELECT COUNT(*) FROM {silver_table}").collect()[0][0]      # noqa: F821
+bad_total  = spark.sql(f"SELECT COUNT(*) FROM {quarantine_table}").collect()[0][0]  # noqa: F821
 
 print(f"""
 📊 Silver Results:
-   ✅ Good rows   → {silver_db}.silver_transactions : {good_total:,}
-   🚫 Bad rows    → {silver_db}.silver_quarantine   : {bad_total:,}
+   ✅ Good rows   → {silver_table} : {good_total:,}
+   🚫 Bad rows    → {quarantine_table} : {bad_total:,}
    📦 Total       : {good_total + bad_total:,}
 
 📂 Silver Locations:
@@ -195,7 +206,7 @@ print(f"""
 """)
 
 print("\n📋 Silver sample (5 good rows):")
-spark.sql(f"""                                                     # noqa: F821
+spark.sql(f"""
     SELECT
         TransactionID,
         AccountID,
@@ -204,6 +215,6 @@ spark.sql(f"""                                                     # noqa: F821
         CustomerAge,
         LoginAttempts,
         AccountBalance
-    FROM {silver_db}.silver_transactions
+    FROM {silver_table}
     LIMIT 5
-""").show(truncate=False)
+""").show(truncate=False)                                          # noqa: F821
