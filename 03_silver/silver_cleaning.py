@@ -1,127 +1,209 @@
-"""Silver cleaning and quarantine split for the fraud lakehouse.
+"""Silver Cleaning — foreachBatch pattern (study notes style).
 
-Silver is where raw ingest becomes analytically trustworthy. The code uses foreachBatch so
-good records, quarantine records, and operator summaries can all be produced from one stream.
+Pattern:
+  readStream.table(bronze)
+  → foreachBatch → micro_processing()
+      → try_cast  (defensive casting)
+      → filter    (good rows only)
+      → quarantine (bad rows saved separately)
+      → write good → silver_data    (partitioned by date)
+      → write bad  → silver_quarantine
+  → writeStream with checkpointLocation
+
+Usage in Databricks notebook:
+    %run ./03_silver/silver_cleaning
 """
 
-from __future__ import annotations
+from pyspark.sql import functions as F
+from pyspark.sql.functions import col, expr, current_date
 
-import json
-import os
-from pathlib import Path
+# ── STEP 1: Environment Widget ────────────────────────────────────────────────
+dbutils.widgets.dropdown("environment", "test", ["test", "prod"])  # noqa: F821
+env = dbutils.widgets.get("environment")                           # noqa: F821
 
-from openai import OpenAI
+print(f"🌍 Environment : {env}")
 
-BUCKET_NAME = "fraud-transection-detection"
-CONFIG_PATH = Path("config/llm_pipeline_config.json")
+# ── STEP 2: All Paths ────────────────────────────────────────────────────────
+base_path    = f"s3://fraud-transection-detection-nabo/{env}"
+silver_path  = f"{base_path}/silver"
+bronze_db    = f"fraud_{env}"
+silver_db    = f"fraud_{env}"
 
-try:
-    dbutils.widgets.dropdown("environment", "test", ["dev", "test", "prod"])
-    ENVIRONMENT = dbutils.widgets.get("environment")
-except Exception:
-    ENVIRONMENT = os.getenv("ENVIRONMENT", "test")
+print(f"📂 Silver path       : {silver_path}")
+print(f"📂 Silver data       : {silver_path}/silver_data")
+print(f"📂 Silver quarantine : {silver_path}/silver_quarantine")
 
+# ── STEP 3: Read from Bronze using readStream ─────────────────────────────────
+# IMPORTANT: readStream.table() already has schema → cannot redefine using .schema()
+# We read directly from the registered Bronze Delta table!
+print(f"\n📖 Reading from Bronze table: {bronze_db}.bronze")
 
-def call_llm(prompt: str) -> str:
-    """Generate operator-facing text, but never let an API outage stop the stream."""
-
-    api_key = os.getenv("OPENAI_API_KEY")
-    if api_key:
-        try:
-            client = OpenAI(api_key=api_key)
-            response = client.chat.completions.create(
-                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-                temperature=0,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return response.choices[0].message.content or ""
-        except Exception as exc:
-            print(f"OpenAI call failed, using fallback: {exc}")
-    return "Manual fallback: quarantine rules were generated from deterministic validations."
+bronze_df = spark.readStream.table(f"{bronze_db}.bronze")          # noqa: F821
 
 
-def load_rules() -> list[str]:
-    config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    return config.get("quarantine_rules", [])
+# ── STEP 4: foreachBatch micro_processing() ───────────────────────────────────
+# foreachBatch = processes each micro-batch as a normal DataFrame
+# Why foreachBatch?
+#   → Can split one batch into MULTIPLE outputs (silver + quarantine)
+#   → Can cache/unpersist for performance
+#   → More control than plain writeStream
+def micro_processing(batch_df, batch_id):
+    print(f"\n⚙️  Processing batch_id: {batch_id}")
+    print(f"   Incoming rows: {batch_df.count()}")
 
+    # Cache for performance (read batch_df twice: good + bad)
+    batch_df.cache()
 
-def build_quarantine_case_when(rules: list[str]) -> str:
-    """Build CASE WHEN SQL that explains why records were quarantined."""
+    # ── GOOD ROWS: Defensive casting + filtering ──────────────────────────────
+    # try_cast = safe conversion → returns NULL instead of crashing!
+    # alias() required after try_cast
+    cleaned_df = batch_df.select(
+        expr("try_cast(TransactionAmount  as double)" ).alias("TransactionAmount"),
+        expr("try_cast(TransactionDate    as date)"   ).alias("TransactionDate"),
+        expr("try_cast(CustomerAge        as int)"    ).alias("CustomerAge"),
+        expr("try_cast(LoginAttempts      as int)"    ).alias("LoginAttempts"),
+        expr("try_cast(AccountBalance     as double)" ).alias("AccountBalance"),
+        expr("try_cast(TransactionDuration as int)"   ).alias("TransactionDuration"),
+        expr("try_cast(PreviousTransactionDate as date)").alias("PreviousTransactionDate"),
+        col("TransactionID"),
+        col("AccountID"),
+        col("TransactionType"),
+        col("Location"),
+        col("DeviceID"),
+        col("IP_Address"),
+        col("MerchantID"),
+        col("Channel"),
+        col("CustomerOccupation"),
+        col("_rescued_data"),
+        col("_ingestion_timestamp"),
+        col("_ingestion_date"),
+        col("_source_file"),
+        col("_environment"),
+    ).filter(
+        # Good rows: rescued_data NULL + valid amount + valid date + no future dates
+        (col("_rescued_data").isNull()) &
+        (col("TransactionAmount").isNotNull()) &
+        (col("TransactionAmount") > 0) &
+        (col("TransactionDate").isNotNull()) &
+        (col("TransactionDate") <= current_date())
+    ).dropDuplicates(["TransactionID", "AccountID"])
 
-    if not rules:
-        rules = ["amount IS NULL", "transaction_date IS NULL", "is_fraud NOT IN (0, 1)"]
-    clauses = [f"WHEN {rule} THEN '{rule}'" for rule in rules]
-    return "CASE " + " ".join(clauses) + " ELSE NULL END AS quarantine_reason"
-
-
-def silver_paths() -> dict[str, str]:
-    base = f"s3://{BUCKET_NAME}/{ENVIRONMENT}"
-    return {
-        "checkpoint": f"{base}/_checkpoints/silver_cleaning_stream/",
-        "silver_data": f"{base}/silver/data/",
-        "silver_quarantine": f"{base}/silver/quarantine/",
-    }
-
-
-def process_micro_batch(batch_df, batch_id: int) -> None:
-    """Split clean and quarantined data in a single cached micro-batch.
-
-    Caching is important here because the same input is written to two outputs and summarized
-    for operators. Without cache/unpersist, Spark could recompute the batch multiple times.
-    """
-
-    rules = load_rules()
-    quarantine_sql = build_quarantine_case_when(rules)
-    batch_df.createOrReplaceTempView("bronze_batch")
-    transformed = batch_df.sparkSession.sql(
-        f"""
-        SELECT
-            sha2(CAST(AccountID AS STRING), 256) AS account_hash,
-            sha2(CAST(MerchantID AS STRING), 256) AS merchant_hash,
-            CAST(TransactionID AS STRING) AS tr_id,
-            try_cast(TransactionDate AS TIMESTAMP) AS tr_timestamp,
-            date(try_cast(TransactionDate AS TIMESTAMP)) AS tr_date,
-            try_cast(Amount AS DOUBLE) AS amount,
-            CAST(TransactionType AS STRING) AS transaction_type,
-            CAST(Location AS STRING) AS location,
-            try_cast(IsFraud AS INT) AS is_fraud,
-            {quarantine_sql}
-        FROM bronze_batch
-        """
-    ).dropDuplicates(["tr_id"])
-
-    transformed.cache()
-    paths = silver_paths()
-    good_records = transformed.filter("quarantine_reason IS NULL")
-    bad_records = transformed.filter("quarantine_reason IS NOT NULL")
-
-    (
-        good_records.write.format("delta")
-        .mode("append")
-        .partitionBy("tr_date")
-        .save(paths["silver_data"])
-    )
-    bad_records.write.format("delta").mode("append").save(paths["silver_quarantine"])
-
-    summary_prompt = (
-        "Explain this quarantine summary in plain English for a data steward: "
-        f"batch_id={batch_id}, bad_count={bad_records.count()}, rules={rules}"
-    )
-    print(call_llm(summary_prompt))
-    transformed.unpersist()
-
-
-def run_silver_stream(spark) -> None:
-    paths = silver_paths()
-    (
-        spark.readStream.table(f"fraud_{ENVIRONMENT}.bronze")
-        .writeStream.foreachBatch(process_micro_batch)
-        .option("checkpointLocation", paths["checkpoint"])
-        .trigger(availableNow=True)
-        .start()
-        .awaitTermination()
+    # ── BAD ROWS: Quarantine ──────────────────────────────────────────────────
+    # Bad rows = rescued_data NOT NULL OR amount NULL OR date NULL
+    # We KEEP bad rows in quarantine (never delete!)
+    # Why? → Investigate later, audit trail, compliance
+    bad_df = batch_df.filter(
+        (col("_rescued_data").isNotNull()) |
+        (col("TransactionAmount").isNull()) |
+        (col("TransactionDate").isNull()) |
+        (col("TransactionID").isNull()) |
+        (col("AccountID").isNull())
     )
 
+    good_count = cleaned_df.count()
+    bad_count  = bad_df.count()
+    print(f"   ✅ Good rows      : {good_count:,}")
+    print(f"   🚫 Quarantined    : {bad_count:,}")
 
-if __name__ == "__main__":
-    print(build_quarantine_case_when(load_rules() if CONFIG_PATH.exists() else []))
+    # ── Write good rows → Silver (partitioned by date) ────────────────────────
+    # partitionBy("TransactionDate") → creates folders like:
+    #   silver_data/TransactionDate=2026-01-15/part-xxx.parquet
+    # Makes date-range queries 10-100x faster!
+    if good_count > 0:
+        (
+            cleaned_df.write
+            .format("delta")
+            .mode("append")
+            .partitionBy("TransactionDate")
+            .save(f"{silver_path}/silver_data")
+        )
+        print(f"   💾 Good rows written → {silver_path}/silver_data")
+
+    # ── Write bad rows → Quarantine ───────────────────────────────────────────
+    if bad_count > 0:
+        (
+            bad_df.write
+            .format("delta")
+            .mode("append")
+            .save(f"{silver_path}/silver_quarantine")
+        )
+        print(f"   🚫 Bad rows written  → {silver_path}/silver_quarantine")
+
+    # Unpersist cache after use
+    batch_df.unpersist()
+    print(f"   ✅ Batch {batch_id} done!")
+
+
+# ── STEP 5: writeStream with foreachBatch ────────────────────────────────────
+# trigger(availableNow=True) = process all available data then stop
+# checkpointLocation = bookmark — never reprocess same rows!
+# foreachBatch = call micro_processing() for each micro-batch
+print("\n🚀 Starting Silver writeStream...")
+
+query = (
+    bronze_df.writeStream
+    .format("delta")
+    .trigger(availableNow=True)
+    .option("checkpointLocation", f"{silver_path}/checkpoint/")
+    .foreachBatch(micro_processing)
+    .queryName("silver_processing")
+    .start()
+)
+
+# Wait for stream to finish
+query.awaitTermination()
+
+print("\n" + "=" * 60)
+print("🎉 SILVER CLEANING COMPLETE!")
+print("=" * 60)
+
+# ── STEP 6: Register Silver tables in Unity Catalog ──────────────────────────
+spark.sql(f"""                                                     # noqa: F821
+    CREATE TABLE IF NOT EXISTS {silver_db}.silver_transactions
+    USING DELTA
+    LOCATION '{silver_path}/silver_data'
+""")
+
+spark.sql(f"""                                                     # noqa: F821
+    CREATE TABLE IF NOT EXISTS {silver_db}.silver_quarantine
+    USING DELTA
+    LOCATION '{silver_path}/silver_quarantine'
+""")
+
+# ── STEP 7: Validate ─────────────────────────────────────────────────────────
+good_total = spark.sql(f"SELECT COUNT(*) FROM {silver_db}.silver_transactions").collect()[0][0]  # noqa: F821
+bad_total  = spark.sql(f"SELECT COUNT(*) FROM {silver_db}.silver_quarantine").collect()[0][0]   # noqa: F821
+
+print(f"""
+📊 Silver Results:
+   ✅ Good rows   → {silver_db}.silver_transactions : {good_total:,}
+   🚫 Bad rows    → {silver_db}.silver_quarantine   : {bad_total:,}
+   📦 Total       : {good_total + bad_total:,}
+
+📂 Silver Locations:
+   → {silver_path}/silver_data        (partitioned by TransactionDate)
+   → {silver_path}/silver_quarantine  (bad rows for investigation)
+
+🔑 Key Concepts Used:
+   → readStream.table()  : read Bronze as stream
+   → foreachBatch()      : split into good + bad
+   → try_cast()          : safe type conversion
+   → partitionBy()       : fast date-range queries
+   → checkpoint          : never reprocess rows
+
+⏭️  NEXT → 04_gold/gold_aggregation notebook!
+""")
+
+print("\n📋 Silver sample (5 good rows):")
+spark.sql(f"""                                                     # noqa: F821
+    SELECT
+        TransactionID,
+        AccountID,
+        TransactionAmount,
+        TransactionDate,
+        CustomerAge,
+        LoginAttempts,
+        AccountBalance
+    FROM {silver_db}.silver_transactions
+    LIMIT 5
+""").show(truncate=False)
