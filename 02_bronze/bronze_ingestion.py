@@ -18,7 +18,7 @@ env = dbutils.widgets.get("environment")                           # noqa: F821
 
 print(f"🌍 Environment : {env}")
 
-# ── STEP 2: All Paths ────────────────────────────────────────────────────────
+# ── STEP 2: All Paths ─────────────────────────────────────────────────────────
 base_path       = f"s3://fraud-transection-detection-nabo/{env}"
 landing_path    = f"{base_path}/raw-landing/banking_transaction/"
 schema_path     = f"{base_path}/_schemas/bronze_autoloader/"
@@ -30,7 +30,7 @@ print(f"📂 Schema path   : {schema_path}")
 print(f"📂 Checkpoint    : {checkpoint_path}")
 print(f"📂 Bronze DB     : {bronze_db}")
 
-# ── STEP 3: Create Schema (Database) in Unity Catalog ────────────────────────
+# ── STEP 3: Create Schema (Database) in Unity Catalog ─────────────────────────
 # CREATE SCHEMA = just a folder in the 'brain' (Unity Catalog)
 # No data moves until writeStream!
 spark.sql(f"""
@@ -39,35 +39,38 @@ spark.sql(f"""
 """)                                                               # noqa: F821
 print(f"\n✅ Schema ready : {bronze_db}")
 
-# ── STEP 4: Auto Loader readStream ───────────────────────────────────────────
+# ── STEP 4: Auto Loader readStream ────────────────────────────────────────────
 # cloudFiles = Auto Loader (Databricks feature)
 # → Watches S3 folder for new/changed files automatically
-# → schemaHints  = tell Spark the correct types for key columns
-# → rescuedDataColumn = safety net — bad rows go here, not lost!
-# → schemaLocation    = schema memory — locked after first run
+# → schemaHints         = tell Spark the correct types for key columns
+# → rescuedDataColumn   = safety net — bad rows go here, not lost!
+# → schemaLocation      = schema memory — locked after first run
 # → schemaEvolutionMode = addNewColumns — if CSV gets new column, auto add it
+#
+# NOTE: input_file_name() is NOT supported in Unity Catalog!
+#       Use _metadata.file_path instead ✅
 print("\n📖 Setting up Auto Loader readStream...")
 
 df_stream = (
     spark.readStream                                               # noqa: F821
     .format("cloudFiles")
-    .option("cloudFiles.format",            "csv")
-    .option("header",                       "true")
+    .option("cloudFiles.format",           "csv")
+    .option("header",                      "true")
     .option("cloudFiles.schemaHints",
             "TransactionAmount double, "
             "CustomerAge int, "
             "AccountBalance double, "
             "LoginAttempts int, "
             "TransactionDuration int")
-    .option("cloudFiles.rescuedDataColumn",    "_rescued_data")   # safety net
-    .option("cloudFiles.schemaLocation",       schema_path)       # schema memory
-    .option("cloudFiles.schemaEvolutionMode",  "addNewColumns")   # evolution
-    .option("cloudFiles.inferColumnTypes",     "true")
+    .option("cloudFiles.rescuedDataColumn",   "_rescued_data")    # safety net
+    .option("cloudFiles.schemaLocation",      schema_path)        # schema memory
+    .option("cloudFiles.schemaEvolutionMode", "addNewColumns")    # evolution
+    .option("cloudFiles.inferColumnTypes",    "true")
     .load(landing_path)
-    # Add metadata columns on the stream
+    # Add metadata columns
     .withColumn("_ingestion_timestamp", F.current_timestamp())
     .withColumn("_ingestion_date",      F.current_date())
-    .withColumn("_source_file",         F.input_file_name())
+    .withColumn("_source_file",         F.col("_metadata.file_path"))  # ← Unity Catalog safe!
     .withColumn("_environment",         F.lit(env))
     .withColumn("_pipeline_version",    F.lit("1.0"))
     # Fix column name with space → Delta doesn't allow spaces!
@@ -76,7 +79,7 @@ df_stream = (
 
 print("✅ Auto Loader stream configured!")
 
-# ── STEP 5: writeStream → Bronze Delta Table ─────────────────────────────────
+# ── STEP 5: writeStream → Bronze Delta Table ──────────────────────────────────
 # trigger(availableNow=True) = process all available files then stop
 #   (like a batch run but using streaming engine)
 # checkpointLocation = bookmark — remembers which files already processed
@@ -102,12 +105,12 @@ print("\n" + "=" * 60)
 print("🎉 BRONZE INGESTION COMPLETE!")
 print("=" * 60)
 
-# ── STEP 6: Validate ─────────────────────────────────────────────────────────
+# ── STEP 6: Validate ──────────────────────────────────────────────────────────
 count = spark.sql(f"SELECT COUNT(*) as total FROM {bronze_db}.bronze").collect()[0][0]  # noqa: F821
 print(f"\n✅ Total rows in Bronze : {count:,}")
 
 print("\n📋 Sample rows (5):")
-spark.sql(f"""                                                    # noqa: F821
+spark.sql(f"""                                                     # noqa: F821
     SELECT
         TransactionID,
         AccountID,
